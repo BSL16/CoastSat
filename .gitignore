@@ -15,6 +15,7 @@
 *.csv
 *.xml
 /deprecated
+/fes2022b
 /worked_example
 /.virtual_documents
 /examples/tide_model_clipping/load_tide
