@@ -303,30 +303,63 @@ def label_images(metadata,settings):
                 im_viz = selector_water.array
                 selector_water.im_bool = selector_water.im_bool.astype(bool)
                 im_labels[selector_water.im_bool] = settings['labels']['water']
-                
+
                 im_sand_ww_water = im_viz.copy()
-                
+
+                ##############################################################
+                # digitize rock pixels (with lassos) - NEW FOR ROCKY COASTLINES
+                ##############################################################
+                # Check if 'rock' label exists in settings (for backward compatibility)
+                if 'rock' in settings['labels'].keys():
+                    color_rock = settings['colors']['rock']
+                    ax.set_title('Click and hold to draw lassos and select ROCK pixels\nwhen finished press <Enter>')
+                    fig.canvas.draw_idle()
+                    selector_rock = SelectFromImage(ax, implot, color_rock)
+                    key_event = {}
+                    while True:
+                        fig.canvas.draw_idle()
+                        fig.canvas.mpl_connect('key_press_event', press)
+                        plt.waitforbuttonpress()
+                        if key_event.get('pressed') == 'enter':
+                            selector_rock.disconnect()
+                            break
+                        elif key_event.get('pressed') == 'escape':
+                            selector_rock.array = im_sand_ww_water
+                            implot.set_data(selector_rock.array)
+                            fig.canvas.draw_idle()
+                            selector_rock.implot = implot
+                            selector_rock.im_bool = np.zeros((selector_rock.array.shape[0], selector_rock.array.shape[1]))
+                            selector_rock.ind = []
+                    # update im_viz and im_labels
+                    im_viz = selector_rock.array
+                    selector_rock.im_bool = selector_rock.im_bool.astype(bool)
+                    im_labels[selector_rock.im_bool] = settings['labels']['rock']
+                    im_sand_ww_water_rock = im_viz.copy()
+                else:
+                    # No rock class defined, skip this step
+                    im_sand_ww_water_rock = im_sand_ww_water
+
                 ##############################################################
                 # digitize land pixels (with lassos)
                 ##############################################################
                 color_land = settings['colors']['other land features']
                 ax.set_title('Click and hold to draw lassos and select OTHER LAND pixels\nwhen finished press <Enter>')
-                fig.canvas.draw_idle() 
+                fig.canvas.draw_idle()
                 selector_land = SelectFromImage(ax, implot, color_land)
                 key_event = {}
                 while True:
-                    fig.canvas.draw_idle()                         
+                    fig.canvas.draw_idle()
                     fig.canvas.mpl_connect('key_press_event', press)
                     plt.waitforbuttonpress()
                     if key_event.get('pressed') == 'enter':
                         selector_land.disconnect()
                         break
                     elif key_event.get('pressed') == 'escape':
-                        selector_land.array = im_sand_ww_water
+                        selector_land.array = im_sand_ww_water_rock
                         implot.set_data(selector_land.array)
-                        fig.canvas.draw_idle()                         
+                        fig.canvas.draw_idle()
                         selector_land.implot = implot
-                        selector_land.im_bool = np.zeros((selector_land.array.shape[0], selector_land.array.shape[1])) 
+                        selector_land.im_bool = np.zeros((selector_land.array.shape[0], selector_land.array.shape[1]))
                         selector_land.ind=[]
                 # update im_viz and im_labels
                 im_viz = selector_land.array
@@ -379,7 +412,8 @@ def load_labels(train_sites, settings):
     filepath_train = settings['filepath_train']
     # initialize the features dict
     features = dict([])
-    n_features = 20
+    # 24 features: 5 bands + 7 indices (including RI, BSI) + 5 std bands + 7 std indices
+    n_features = 24
     first_row = np.nan*np.ones((1,n_features))
     for key in settings['labels'].keys():
         features[key] = first_row
@@ -474,7 +508,7 @@ def plot_confusion_matrix(y_true,y_pred,classes,normalize=False,cmap=plt.get_cma
     im = ax.imshow(cm, interpolation='nearest', cmap=cmap)
 #    ax.figure.colorbar(im, ax=ax)
     ax.set(xticks=np.arange(cm.shape[1]),
-           yticks=np.arange(cm.shape[0]), ylim=[3.5,-0.5],
+           yticks=np.arange(cm.shape[0]), ylim=[cm.shape[0]-0.5,-0.5],
            xticklabels=classes, yticklabels=classes,
            ylabel='True label',
            xlabel='Predicted label')
@@ -545,10 +579,11 @@ def evaluate_classifier(classifier, metadata, settings):
     # create colormap for labels
     cmap = plt.get_cmap('tab20c')
     colorpalette = cmap(np.arange(0,13,1))
-    colours = np.zeros((3,4))
-    colours[0,:] = colorpalette[5]
-    colours[1,:] = np.array([204/255,1,1,1])
-    colours[2,:] = np.array([0,91/255,1,1])
+    colours = np.zeros((4,4))  # 4 colors for sand, swash, water, rock
+    colours[0,:] = colorpalette[5]  # sand - orange/yellow
+    colours[1,:] = np.array([204/255,1,1,1])  # swash - cyan
+    colours[2,:] = np.array([0,91/255,1,1])  # water - blue
+    colours[3,:] = np.array([139/255,69/255,19/255,1])  # rock - brown (saddle brown)
     # loop through satellites
     for satname in metadata.keys():
         filepath = SDS_tools.get_filepath(settings['inputs'],satname)

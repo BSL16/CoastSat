@@ -122,17 +122,24 @@ def extract_shorelines(metadata, settings):
             str_new = '_new'
         if satname in ['L5','L7','L8','L9']:
             pixel_size = 15
-            if settings['sand_color'] == 'dark':
+            # Check if user wants to use custom classifier (e.g., 5-class with rock)
+            if 'classifier' in settings and settings['classifier'] == 'rock':
+                clf = joblib.load(os.path.join(filepath_models, 'NN_5classes_Landsat_rock%s.pkl'%str_new))
+            elif settings['sand_color'] == 'dark':
                 clf = joblib.load(os.path.join(filepath_models, 'NN_4classes_Landsat_dark%s.pkl'%str_new))
             elif settings['sand_color'] == 'bright':
                 clf = joblib.load(os.path.join(filepath_models, 'NN_4classes_Landsat_bright%s.pkl'%str_new))
             elif settings['sand_color'] == 'default':
                 clf = joblib.load(os.path.join(filepath_models, 'NN_4classes_Landsat%s.pkl'%str_new))
             elif settings['sand_color'] == 'latest':
-                clf = joblib.load(os.path.join(filepath_models, 'NN_4classes_Landsat_latest%s.pkl'%str_new))   
+                clf = joblib.load(os.path.join(filepath_models, 'NN_4classes_Landsat_latest%s.pkl'%str_new))
         elif satname == 'S2':
             pixel_size = 10
-            clf = joblib.load(os.path.join(filepath_models, 'NN_4classes_S2%s.pkl'%str_new))
+            # Check if user wants to use custom classifier (e.g., 5-class with rock)
+            if 'classifier' in settings and settings['classifier'] == 'rock':
+                clf = joblib.load(os.path.join(filepath_models, 'NN_5classes_S2_rock%s.pkl'%str_new))
+            else:
+                clf = joblib.load(os.path.join(filepath_models, 'NN_4classes_S2%s.pkl'%str_new))
 
         # convert settings['min_beach_area'] from metres to pixels
         min_beach_area_pixels = np.ceil(settings['min_beach_area']/pixel_size**2)
@@ -187,19 +194,40 @@ def extract_shorelines(metadata, settings):
                 if skip_image:
                     continue
                 
-            # otherwise map the contours automatically with one of the two following functions:
-            # if there are pixels in the 'sand' class --> use find_wl_contours2 (enhanced)
-            # otherwise use find_wl_contours1 (traditional)
+            # otherwise map the contours automatically with one of the following functions:
+            # - find_wl_contours2: if there are pixels in the 'sand' class (enhanced sand/water)
+            # - find_wl_contours_rock: if there are pixels in the 'rock' class (enhanced rock/water)
+            # - find_wl_contours1: traditional method if no sand or rock pixels detected
             else:
                 try: # use try/except structure for long runs
-                    if sum(im_labels[im_ref_buffer,0]) < 50: # minimum number of sand pixels
+                    # Count sand pixels in the reference buffer
+                    n_sand_pixels = np.sum(im_labels[im_ref_buffer, 0]) if im_labels.shape[2] > 0 else 0
+
+                    # Check if rock class exists (5-class model: im_labels has 4 layers)
+                    has_rock_class = im_labels.shape[2] >= 4
+                    n_rock_pixels = np.sum(im_labels[im_ref_buffer, 3]) if has_rock_class else 0
+
+                    # Minimum number of pixels to use enhanced methods
+                    min_pixels_threshold = 50
+
+                    # Decide which method to use based on coastline type
+                    if n_sand_pixels >= min_pixels_threshold and n_sand_pixels >= n_rock_pixels:
+                        # SANDY COASTLINE: use classification to refine threshold
+                        # and extract the sand/water interface
+                        contours_mwi, t_mndwi = find_wl_contours2(im_ms, im_labels, cloud_mask, im_ref_buffer)
+
+                    elif has_rock_class and n_rock_pixels >= min_pixels_threshold:
+                        # ROCKY COASTLINE: use classification to refine threshold
+                        # and extract the rock/water interface
+                        contours_mwi, t_mndwi = find_wl_contours_rock(im_ms, im_labels, cloud_mask, im_ref_buffer)
+
+                    else:
+                        # TRADITIONAL METHOD: not enough sand or rock pixels
                         # compute MNDWI image (SWIR-G)
                         im_mndwi = SDS_tools.nd_index(im_ms[:,:,4], im_ms[:,:,1], cloud_mask)
                         # find water contours on MNDWI grayscale image
                         contours_mwi, t_mndwi = find_wl_contours1(im_mndwi, cloud_mask, im_ref_buffer)
-                    else:
-                        # use classification to refine threshold and extract the sand/water interface
-                        contours_mwi, t_mndwi = find_wl_contours2(im_ms, im_labels, cloud_mask, im_ref_buffer)
+
                 except:
                     print('Could not map shoreline for this image: ' + filenames[i])
                     continue
@@ -262,27 +290,41 @@ def extract_shorelines(metadata, settings):
 
 def calculate_features(im_ms, cloud_mask, im_bool):
     """
-    Calculates features on the image that are used for the supervised classification. 
-    The features include spectral normalized-difference indices and standard 
+    Calculates features on the image that are used for the supervised classification.
+    The features include spectral normalized-difference indices and standard
     deviation of the image for all the bands and indices.
 
     KV WRL 2018
+    Modified 2024: Added RI (Rock Index) and BSI (Bare Soil Index) for rocky coastline detection.
 
     Arguments:
     -----------
     im_ms: np.array
         RGB + downsampled NIR and SWIR
+        Band order: [0]=Blue, [1]=Green, [2]=Red, [3]=NIR, [4]=SWIR
     cloud_mask: np.array
         2D cloud mask with True where cloud pixels are
     im_bool: np.array
         2D array of boolean indicating where on the image to calculate the features
 
-    Returns:    
+    Returns:
     -----------
     features: np.array
         matrix containing each feature (columns) calculated for all
         the pixels (rows) indicated in im_bool
-        
+
+    Features order (24 total):
+        [0-4]   : 5 spectral bands (B, G, R, NIR, SWIR)
+        [5]     : NIR-G (NDWI)
+        [6]     : SWIR-G (MNDWI)
+        [7]     : NIR-R (close to NDVI)
+        [8]     : SWIR-NIR (equivalent to NDBI)
+        [9]     : B-R
+        [10]    : RI - Rock Index (R-G)/(R+G) - NEW for rocky coastlines
+        [11]    : BSI - Bare Soil Index - NEW for rocky coastlines
+        [12-16] : std of 5 spectral bands
+        [17-23] : std of 7 spectral indices
+
     """
 
     # add all the multispectral bands
@@ -290,26 +332,51 @@ def calculate_features(im_ms, cloud_mask, im_bool):
     for k in range(1,im_ms.shape[2]):
         feature = np.expand_dims(im_ms[im_bool,k],axis=1)
         features = np.append(features, feature, axis=-1)
-    # NIR-G
+
+    # ===== EXISTING SPECTRAL INDICES =====
+    # NIR-G (NDWI - Normalized Difference Water Index)
     im_NIRG = SDS_tools.nd_index(im_ms[:,:,3], im_ms[:,:,1], cloud_mask)
     features = np.append(features, np.expand_dims(im_NIRG[im_bool],axis=1), axis=-1)
-    # SWIR-G
+    # SWIR-G (MNDWI - Modified Normalized Difference Water Index)
     im_SWIRG = SDS_tools.nd_index(im_ms[:,:,4], im_ms[:,:,1], cloud_mask)
     features = np.append(features, np.expand_dims(im_SWIRG[im_bool],axis=1), axis=-1)
-    # NIR-R
+    # NIR-R (close to NDVI)
     im_NIRR = SDS_tools.nd_index(im_ms[:,:,3], im_ms[:,:,2], cloud_mask)
     features = np.append(features, np.expand_dims(im_NIRR[im_bool],axis=1), axis=-1)
-    # SWIR-NIR
+    # SWIR-NIR (equivalent to NDBI - Normalized Difference Built-up Index)
+    # Note: NDBI = (SWIR - NIR) / (SWIR + NIR) - high values for mineral/rocky areas
     im_SWIRNIR = SDS_tools.nd_index(im_ms[:,:,4], im_ms[:,:,3], cloud_mask)
     features = np.append(features, np.expand_dims(im_SWIRNIR[im_bool],axis=1), axis=-1)
     # B-R
     im_BR = SDS_tools.nd_index(im_ms[:,:,0], im_ms[:,:,2], cloud_mask)
     features = np.append(features, np.expand_dims(im_BR[im_bool],axis=1), axis=-1)
+
+    # ===== NEW INDICES FOR ROCKY COASTLINE DETECTION =====
+    # RI - Rock Index: (Red - Green) / (Red + Green)
+    # Rocks often have higher reflectance in red than green
+    # Positive values indicate rocky/mineral surfaces
+    im_RI = SDS_tools.nd_index(im_ms[:,:,2], im_ms[:,:,1], cloud_mask)
+    features = np.append(features, np.expand_dims(im_RI[im_bool],axis=1), axis=-1)
+
+    # BSI - Bare Soil Index: ((SWIR + Red) - (NIR + Blue)) / ((SWIR + Red) + (NIR + Blue))
+    # Discriminates bare soil and mineral surfaces from vegetation
+    # High values for rocks, low values for vegetation and water
+    im_BSI_num = (im_ms[:,:,4] + im_ms[:,:,2]) - (im_ms[:,:,3] + im_ms[:,:,0])
+    im_BSI_den = (im_ms[:,:,4] + im_ms[:,:,2]) + (im_ms[:,:,3] + im_ms[:,:,0])
+    im_BSI = np.divide(im_BSI_num, im_BSI_den,
+                       out=np.zeros_like(im_BSI_num, dtype=float),
+                       where=im_BSI_den!=0)
+    im_BSI[cloud_mask] = np.nan
+    features = np.append(features, np.expand_dims(im_BSI[im_bool],axis=1), axis=-1)
+
+    # ===== STANDARD DEVIATION OF SPECTRAL BANDS =====
     # calculate standard deviation of individual bands
     for k in range(im_ms.shape[2]):
-        im_std =  SDS_tools.image_std(im_ms[:,:,k], 1)
+        im_std = SDS_tools.image_std(im_ms[:,:,k], 1)
         features = np.append(features, np.expand_dims(im_std[im_bool],axis=1), axis=-1)
-    # calculate standard deviation of the spectral indices
+
+    # ===== STANDARD DEVIATION OF SPECTRAL INDICES =====
+    # calculate standard deviation of the existing spectral indices
     im_std = SDS_tools.image_std(im_NIRG, 1)
     features = np.append(features, np.expand_dims(im_std[im_bool],axis=1), axis=-1)
     im_std = SDS_tools.image_std(im_SWIRG, 1)
@@ -321,19 +388,27 @@ def calculate_features(im_ms, cloud_mask, im_bool):
     im_std = SDS_tools.image_std(im_BR, 1)
     features = np.append(features, np.expand_dims(im_std[im_bool],axis=1), axis=-1)
 
+    # calculate standard deviation of the NEW spectral indices for rocky coastlines
+    im_std = SDS_tools.image_std(im_RI, 1)
+    features = np.append(features, np.expand_dims(im_std[im_bool],axis=1), axis=-1)
+    im_std = SDS_tools.image_std(im_BSI, 1)
+    features = np.append(features, np.expand_dims(im_std[im_bool],axis=1), axis=-1)
+
     return features
 
 def classify_image_NN(im_ms, cloud_mask, min_beach_area, clf):
     """
-    Classifies every pixel in the image in one of 4 classes:
+    Classifies every pixel in the image in one of 5 classes:
         - sand                                          --> label = 1
         - whitewater (breaking waves and swash)         --> label = 2
         - water                                         --> label = 3
-        - other (vegetation, buildings, rocks...)       --> label = 0
+        - rock (rocky coastline, cliffs, platforms)     --> label = 4  (NEW)
+        - other (vegetation, buildings...)              --> label = 0
 
     The classifier is a Neural Network that is already trained.
 
     KV WRL 2018
+    Modified 2024: Added rock class (label=4) for rocky coastline detection.
 
     Arguments:
     -----------
@@ -342,29 +417,39 @@ def classify_image_NN(im_ms, cloud_mask, min_beach_area, clf):
     cloud_mask: np.array
         2D cloud mask with True where cloud pixels are
     min_beach_area: int
-        minimum number of pixels that have to be connected to belong to the SAND class
+        minimum number of pixels that have to be connected to belong to the SAND or ROCK class
     clf: joblib object
-        pre-trained classifier
+        pre-trained classifier (4 classes for legacy, 5 classes for rocky coastlines)
 
-    Returns:    
+    Returns:
     -----------
     im_classif: np.array
-        2D image containing labels
+        2D image containing labels (0=other, 1=sand, 2=whitewater, 3=water, 4=rock)
     im_labels: np.array of booleans
-        3D image containing a boolean image for each class (im_classif == label)
+        3D/4D image containing a boolean image for each class
+        - Legacy 4-class model: (sand, swash, water) - shape [..., 3]
+        - New 5-class model: (sand, swash, water, rock) - shape [..., 4]
 
     """
 
     # calculate features
     vec_features = calculate_features(im_ms, cloud_mask, np.ones(cloud_mask.shape).astype(bool))
-    vec_features[np.isnan(vec_features)] = 1e-9 # NaN values are create when std is too close to 0
+    vec_features[np.isnan(vec_features)] = 1e-9 # NaN values are created when std is too close to 0
 
     # remove NaNs and cloudy pixels
     vec_cloud = cloud_mask.reshape(cloud_mask.shape[0]*cloud_mask.shape[1])
     vec_nan = np.any(np.isnan(vec_features), axis=1)
-    vec_inf = np.any(np.isinf(vec_features), axis=1)    
-    vec_mask = np.logical_or(vec_cloud,np.logical_or(vec_nan,vec_inf))
+    vec_inf = np.any(np.isinf(vec_features), axis=1)
+    vec_mask = np.logical_or(vec_cloud, np.logical_or(vec_nan, vec_inf))
     vec_features = vec_features[~vec_mask, :]
+
+    # BACKWARD COMPATIBILITY: Check if classifier expects 20 or 24 features
+    # Old classifiers (4-class) expect 20 features, new classifiers (5-class with rock) expect 24
+    n_features_expected = clf.n_features_in_ if hasattr(clf, 'n_features_in_') else 20
+    if n_features_expected == 20 and vec_features.shape[1] == 24:
+        # Remove RI, BSI features (indices 10,11) and std_RI, std_BSI (indices 22,23)
+        # Keep: 0-9 (bands + 5 indices), skip 10-11, keep 12-21 (std_bands + 5 std_indices), skip 22-23
+        vec_features = np.delete(vec_features, [10, 11, 22, 23], axis=1)
 
     # classify pixels
     labels = clf.predict(vec_features)
@@ -378,11 +463,26 @@ def classify_image_NN(im_ms, cloud_mask, min_beach_area, clf):
     im_sand = im_classif == 1
     im_swash = im_classif == 2
     im_water = im_classif == 3
+
     # remove small patches of sand or water that could be around the image (usually noise)
     im_sand = morphology.remove_small_objects(im_sand, min_size=min_beach_area, connectivity=2)
     im_water = morphology.remove_small_objects(im_water, min_size=min_beach_area, connectivity=2)
 
-    im_labels = np.stack((im_sand,im_swash,im_water), axis=-1)
+    # Check if classifier has 5 classes (new model with rock detection)
+    # by checking if any pixel is classified as rock (label=4)
+    has_rock_class = np.any(im_classif == 4)
+
+    if has_rock_class:
+        # NEW 5-class model: include rock class
+        im_rock = im_classif == 4
+        # remove small patches of rock (noise filtering)
+        im_rock = morphology.remove_small_objects(im_rock, min_size=min_beach_area, connectivity=2)
+        # Stack with 4 layers: sand, swash, water, rock
+        im_labels = np.stack((im_sand, im_swash, im_water, im_rock), axis=-1)
+    else:
+        # Legacy 4-class model: no rock class
+        # Stack with 3 layers: sand, swash, water
+        im_labels = np.stack((im_sand, im_swash, im_water), axis=-1)
 
     return im_classif, im_labels
 
@@ -501,6 +601,90 @@ def find_wl_contours2(im_ms, im_labels, cloud_mask, im_ref_buffer):
 
     # threshold the sand/water intensities
     int_all = np.append(int_water,int_sand, axis=0)
+    t_mwi = filters.threshold_otsu(int_all[:,0])
+    t_wi = filters.threshold_otsu(int_all[:,1])
+
+    # find contour with Marching-Squares algorithm
+    im_wi_buffer = np.copy(im_wi)
+    im_wi_buffer[~im_ref_buffer] = np.nan
+    im_mwi_buffer = np.copy(im_mwi)
+    im_mwi_buffer[~im_ref_buffer] = np.nan
+    contours_wi = measure.find_contours(im_wi_buffer, t_wi)
+    contours_mwi = measure.find_contours(im_mwi_buffer, t_mwi)
+    # remove contour points that are NaNs (around clouds)
+    contours_wi = process_contours(contours_wi)
+    contours_mwi = process_contours(contours_mwi)
+
+    # only return MNDWI contours and threshold
+    return contours_mwi, t_mwi
+
+def find_wl_contours_rock(im_ms, im_labels, cloud_mask, im_ref_buffer):
+    """
+    Method for extracting rocky shorelines. Incorporates the classification
+    component to refine the threshold and make it specific to the rock/water interface.
+
+    This function is similar to find_wl_contours2() but uses the rock class
+    instead of the sand class for threshold determination.
+
+    Created 2024 for rocky coastline detection.
+
+    Arguments:
+    -----------
+    im_ms: np.array
+        RGB + downsampled NIR and SWIR
+    im_labels: np.array
+        3D/4D image containing a boolean image for each class
+        For 5-class model: (sand, swash, water, rock) - rock is at index 3
+    cloud_mask: np.array
+        2D cloud mask with True where cloud pixels are
+    im_ref_buffer: np.array
+        binary image containing a buffer around the reference shoreline
+
+    Returns:
+    -----------
+    contours_mwi: list of np.arrays
+        contains the coordinates of the contour lines extracted from the
+        MNDWI (Modified Normalized Difference Water Index) image
+    t_mwi: float
+        Otsu rock/water threshold used to map the contours
+
+    """
+
+    nrows = cloud_mask.shape[0]
+    ncols = cloud_mask.shape[1]
+
+    # calculate Normalized Difference Modified Water Index (SWIR - G)
+    im_mwi = SDS_tools.nd_index(im_ms[:,:,4], im_ms[:,:,1], cloud_mask)
+    # calculate Normalized Difference Water Index (NIR - G)
+    im_wi = SDS_tools.nd_index(im_ms[:,:,3], im_ms[:,:,1], cloud_mask)
+    # stack indices together
+    im_ind = np.stack((im_wi, im_mwi), axis=-1)
+    vec_ind = im_ind.reshape(nrows*ncols, 2)
+
+    # reshape labels into vectors
+    # Rock is at index 3 in the 5-class model (sand=0, swash=1, water=2, rock=3)
+    vec_rock = im_labels[:,:,3].reshape(ncols*nrows)
+    vec_water = im_labels[:,:,2].reshape(ncols*nrows)
+
+    # use im_ref_buffer and dilate it by 5 pixels
+    se = morphology.disk(5)
+    im_ref_buffer_extra = morphology.binary_dilation(im_ref_buffer, se)
+    # create a buffer around the rocky coastline
+    vec_buffer = im_ref_buffer_extra.reshape(nrows*ncols)
+
+    # select water/rock pixels that are within the buffer
+    int_water = vec_ind[np.logical_and(vec_buffer, vec_water), :]
+    int_rock = vec_ind[np.logical_and(vec_buffer, vec_rock), :]
+
+    # make sure both classes have the same number of pixels before thresholding
+    if len(int_water) > 0 and len(int_rock) > 0:
+        if np.argmin([int_rock.shape[0], int_water.shape[0]]) == 1:
+            int_rock = int_rock[np.random.choice(int_rock.shape[0], int_water.shape[0], replace=False), :]
+        else:
+            int_water = int_water[np.random.choice(int_water.shape[0], int_rock.shape[0], replace=False), :]
+
+    # threshold the rock/water intensities
+    int_all = np.append(int_water, int_rock, axis=0)
     t_mwi = filters.threshold_otsu(int_all[:,0])
     t_wi = filters.threshold_otsu(int_all[:,1])
 
@@ -767,11 +951,15 @@ def show_detection(im_ms, cloud_mask, im_labels, shoreline,image_epsg, georef,
     im_class = np.copy(im_RGB)
     cmap = plt.get_cmap('tab20c')
     colorpalette = cmap(np.arange(0,13,1))
-    colours = np.zeros((3,4))
-    colours[0,:] = colorpalette[5]
-    colours[1,:] = np.array([204/255,1,1,1])
-    colours[2,:] = np.array([0,91/255,1,1])
-    for k in range(0,im_labels.shape[2]):
+    # Support both 3-layer (4-class) and 4-layer (5-class with rock) classifiers
+    n_classes = im_labels.shape[2]
+    colours = np.zeros((n_classes, 4))
+    colours[0,:] = colorpalette[5]  # sand - orange/yellow
+    colours[1,:] = np.array([204/255,1,1,1])  # swash - cyan
+    colours[2,:] = np.array([0,91/255,1,1])  # water - blue
+    if n_classes >= 4:
+        colours[3,:] = np.array([139/255,69/255,19/255,1])  # rock - brown (saddle brown)
+    for k in range(0, n_classes):
         im_class[im_labels[:,:,k],0] = colours[k,0]
         im_class[im_labels[:,:,k],1] = colours[k,1]
         im_class[im_labels[:,:,k],2] = colours[k,2]
@@ -852,8 +1040,13 @@ def show_detection(im_ms, cloud_mask, im_labels, shoreline,image_epsg, georef,
     white_patch = mpatches.Patch(color=colours[1,:], label='whitewater')
     blue_patch = mpatches.Patch(color=colours[2,:], label='water')
     black_line = mlines.Line2D([],[],color='k',linestyle='-', label='shoreline')
-    ax2.legend(handles=[orange_patch,white_patch,blue_patch, black_line],
-               bbox_to_anchor=(1, 0.5), fontsize=10)
+    # Build legend handles - add rock if using 5-class classifier
+    legend_handles = [orange_patch, white_patch, blue_patch]
+    if n_classes >= 4:
+        brown_patch = mpatches.Patch(color=colours[3,:], label='rock')
+        legend_handles.append(brown_patch)
+    legend_handles.append(black_line)
+    ax2.legend(handles=legend_handles, bbox_to_anchor=(1, 0.5), fontsize=10)
     ax2.set_title(date, fontweight='bold', fontsize=12)
 
     # create image 3 (MNDWI)
@@ -982,11 +1175,15 @@ def adjust_detection(im_ms, cloud_mask, im_nodata, im_labels, im_ref_buffer, ima
     im_class = np.copy(im_RGB)
     cmap = plt.get_cmap('tab20c')
     colorpalette = cmap(np.arange(0,13,1))
-    colours = np.zeros((3,4))
-    colours[0,:] = colorpalette[5]
-    colours[1,:] = np.array([204/255,1,1,1])
-    colours[2,:] = np.array([0,91/255,1,1])
-    for k in range(0,im_labels.shape[2]):
+    # Support both 3-layer (4-class) and 4-layer (5-class with rock) classifiers
+    n_classes = im_labels.shape[2]
+    colours = np.zeros((n_classes, 4))
+    colours[0,:] = colorpalette[5]  # sand - orange/yellow
+    colours[1,:] = np.array([204/255,1,1,1])  # swash - cyan
+    colours[2,:] = np.array([0,91/255,1,1])  # water - blue
+    if n_classes >= 4:
+        colours[3,:] = np.array([139/255,69/255,19/255,1])  # rock - brown (saddle brown)
+    for k in range(0, n_classes):
         im_class[im_labels[:,:,k],0] = colours[k,0]
         im_class[im_labels[:,:,k],1] = colours[k,1]
         im_class[im_labels[:,:,k],2] = colours[k,2]
@@ -1045,8 +1242,13 @@ def adjust_detection(im_ms, cloud_mask, im_nodata, im_labels, im_ref_buffer, ima
     white_patch = mpatches.Patch(color=colours[1,:], label='whitewater')
     blue_patch = mpatches.Patch(color=colours[2,:], label='water')
     black_line = mlines.Line2D([],[],color='k',linestyle='-', label='shoreline')
-    ax2.legend(handles=[orange_patch,white_patch,blue_patch, black_line],
-               bbox_to_anchor=(1.1, 0.5), fontsize=10)
+    # Build legend handles - add rock if using 5-class classifier
+    legend_handles = [orange_patch, white_patch, blue_patch]
+    if n_classes >= 4:
+        brown_patch = mpatches.Patch(color=colours[3,:], label='rock')
+        legend_handles.append(brown_patch)
+    legend_handles.append(black_line)
+    ax2.legend(handles=legend_handles, bbox_to_anchor=(1.1, 0.5), fontsize=10)
     ax2.set_title(date_str, fontsize=12)
 
     # plot image 3 (MNDWI)
